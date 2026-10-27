@@ -1,0 +1,22 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Compiled app bundle & binaries (built via ./build.sh)
+AI Pulse.app/
+*.dSYM/
+*.o
+
+# Xcode / SwiftPM artifacts
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
