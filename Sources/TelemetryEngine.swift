@@ -1760,7 +1760,9 @@ final class TelemetryEngine: ObservableObject {
             let startOffset = end > maxBytes ? (end - maxBytes) : 0
             try handle.seek(toOffset: startOffset)
             let data = handle.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)
+            // 截断点常落在中文/emoji 等多字节 UTF-8 字符中间，严格解码会让整段返回 nil；
+            // 宽松解码只会损坏残缺的首行，而首行本就会被调用方的逐行 JSON 解析跳过
+            return String(decoding: data, as: UTF8.self)
         } catch {
             return nil
         }

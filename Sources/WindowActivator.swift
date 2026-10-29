@@ -86,10 +86,16 @@ final class WindowActivator: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func raiseMatchingWindow(bundleId: String, windowKeyword: String) {
-        let escapedKeyword = windowKeyword.replacingOccurrences(of: "\"", with: "\\\"")
+        // 必须先转义反斜杠再转义双引号：否则输入里的 `\"` 会提前闭合 AppleScript 字符串，拼出可执行的脚本
+        func appleScriptEscaped(_ text: String) -> String {
+            text.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let escapedBundleId = appleScriptEscaped(bundleId)
+        let escapedKeyword = appleScriptEscaped(windowKeyword)
         let script = """
         tell application "System Events"
-            set procList to every process whose bundle identifier is "\(bundleId)"
+            set procList to every process whose bundle identifier is "\(escapedBundleId)"
             if (count of procList) > 0 then
                 set targetProc to item 1 of procList
                 set frontmost of targetProc to true

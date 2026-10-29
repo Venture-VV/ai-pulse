@@ -191,9 +191,9 @@ struct MainHUDView: View {
                     engine.activeAlert = nil
                 }) {
                     HStack(spacing: 6) {
-                        Text("✨ \(alert.appName) 已搞定")
+                        Text(alert.status == .waiting ? "🟠 \(alert.appName) 等你拍板" : "✨ \(alert.appName) 已搞定")
                             .font(.system(size: 12, weight: .heavy, design: .rounded))
-                            .foregroundColor(Color(red: 0.25, green: 0.96, blue: 0.68))
+                            .foregroundColor(alert.status == .waiting ? .orange : Color(red: 0.25, green: 0.96, blue: 0.68))
                             .lineLimit(1)
                         Text("闪现 ↗")
                             .font(.system(size: 10.5, weight: .bold, design: .rounded))
@@ -1163,7 +1163,7 @@ struct TaskCardView: View {
                     .frame(width: 6, height: 6)
             }
 
-            Text(item.justCompleted ? "刚刚搞定" : item.status.label)
+            Text((item.justCompleted && item.status == .completed) ? "刚刚搞定" : item.status.label)
                 .font(.system(size: 10.5, weight: .heavy, design: .rounded))
                 .foregroundColor(item.status.badgeColor)
         }

@@ -820,6 +820,17 @@ public enum StressTestRunner {
             allPassed = false
         }
 
+        // 尾部读取的起点落在中文（3 字节 UTF-8）字符中间时仍须读出内容：连续 3 个窗口大小中必有 2 个截在字符中间
+        let cjkLogPath = "\(tempDir)/cjk_session.jsonl"
+        try? (String(repeating: "中文转录", count: 1000) + "\n" + sampleLine).write(toFile: cjkLogPath, atomically: true, encoding: .utf8)
+        let cjkTailOk = (UInt64(1000)...UInt64(1002)).allSatisfy { engine.stressTestTailRead(path: cjkLogPath, maxBytes: $0) }
+        if cjkTailOk {
+            print("  ✓ Tail read starting inside a multi-byte UTF-8 (CJK) character still decodes")
+        } else {
+            print("  ✗ FAIL: Tail read starting inside a multi-byte UTF-8 (CJK) character returned nil")
+            allPassed = false
+        }
+
         // Suite 4: Notification Anti-Spam State Machine Verification
         print("\n[Suite 4/4] Notification Anti-Spam State Machine Verification (200 rapid frames)...")
         let alertCheckPassed = engine.stressTestNotificationAntiSpam()
