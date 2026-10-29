@@ -7,22 +7,24 @@ final class AppIconCache {
     private var cache: [String: NSImage] = [:]
 
     func icon(for appPath: String, bundleId: String) -> NSImage {
-        if let cached = cache[appPath] {
+        let key = "\(appPath)|\(bundleId)"
+        if let cached = cache[key] {
             return cached
         }
-        if FileManager.default.fileExists(atPath: appPath) {
+        if !appPath.isEmpty, FileManager.default.fileExists(atPath: appPath) {
             let img = NSWorkspace.shared.icon(forFile: appPath)
             img.size = NSSize(width: 32, height: 32)
-            cache[appPath] = img
+            cache[key] = img
             return img
         }
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+        if !bundleId.isEmpty, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
             let img = NSWorkspace.shared.icon(forFile: url.path)
             img.size = NSSize(width: 32, height: 32)
-            cache[appPath] = img
+            cache[key] = img
             return img
         }
         let fallback = NSImage(systemSymbolName: "cpu.fill", accessibilityDescription: nil) ?? NSImage()
+        cache[key] = fallback
         return fallback
     }
 }
@@ -86,34 +88,35 @@ final class WindowActivator: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func raiseMatchingWindow(bundleId: String, windowKeyword: String) {
-        // 必须先转义反斜杠再转义双引号：否则输入里的 `\"` 会提前闭合 AppleScript 字符串，拼出可执行的脚本
-        func appleScriptEscaped(_ text: String) -> String {
-            text.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-        }
-        let escapedBundleId = appleScriptEscaped(bundleId)
-        let escapedKeyword = appleScriptEscaped(windowKeyword)
+        guard !bundleId.isEmpty, !windowKeyword.isEmpty else { return }
+        // 使用 /usr/bin/osascript 的 on run argv 参数传递，既可在后台线程安全运行（NSAppleScript 仅限主线程），又彻底杜绝脚本字符串拼接注入
         let script = """
-        tell application "System Events"
-            set procList to every process whose bundle identifier is "\(escapedBundleId)"
-            if (count of procList) > 0 then
-                set targetProc to item 1 of procList
-                set frontmost of targetProc to true
-                repeat with w in (every window of targetProc)
-                    try
-                        if (name of w) contains "\(escapedKeyword)" then
-                            perform action "AXRaise" of w
-                            exit repeat
-                        end if
-                    end try
-                end repeat
-            end if
-        end tell
+        on run argv
+            set targetBundle to item 1 of argv
+            set kw to item 2 of argv
+            tell application "System Events"
+                set procList to every process whose bundle identifier is targetBundle
+                if (count of procList) > 0 then
+                    set targetProc to item 1 of procList
+                    set frontmost of targetProc to true
+                    repeat with w in (every window of targetProc)
+                        try
+                            if (name of w) contains kw then
+                                perform action "AXRaise" of w
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                end if
+            end tell
+        end run
         """
-        var error: NSDictionary?
-        if let appleScript = NSAppleScript(source: script) {
-            appleScript.executeAndReturnError(&error)
-        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script, bundleId, windowKeyword]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
     }
 
     /// 在 Finder 中打开项目工作区目录
@@ -122,7 +125,7 @@ final class WindowActivator: NSObject, UNUserNotificationCenterDelegate {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
     }
 
-    /// 发送完成/待确认提醒（支持面板内静默提醒、音效、语音、可选系统横幅，且同一软件固定替换 ID 绝不堆叠轰炸）
+    /// 发送完成/待确认/异常提醒（支持面板内静默提醒、音效、语音、可选系统横幅，且同一软件固定替换 ID 绝不堆叠轰炸）
     func triggerAlert(
         alert: CompletionAlert,
         soundEnabled: Bool,
@@ -130,14 +133,24 @@ final class WindowActivator: NSObject, UNUserNotificationCenterDelegate {
         systemBannerEnabled: Bool
     ) {
         if soundEnabled {
-            let soundName = (alert.status == .waiting) ? "Funk" : "Glass"
+            let soundName: String
+            switch alert.status {
+            case .waiting: soundName = "Funk"
+            case .error: soundName = "Basso"
+            default: soundName = "Glass"
+            }
             if let sound = NSSound(named: NSSound.Name(soundName)) {
                 sound.play()
             }
         }
 
         if voiceEnabled {
-            let actionText = (alert.status == .waiting) ? "等待您的确认" : "任务已完成"
+            let actionText: String
+            switch alert.status {
+            case .waiting: actionText = "等待您的确认"
+            case .error: actionText = "任务执行异常"
+            default: actionText = "任务已完成"
+            }
             let speechText = "\(alert.appName)，\(actionText)"
             if !speechSynthesizer.isSpeaking {
                 let utterance = AVSpeechUtterance(string: speechText)
@@ -150,7 +163,12 @@ final class WindowActivator: NSObject, UNUserNotificationCenterDelegate {
         // 仅在用户开启“系统原生弹窗”时才推送到 macOS 通知中心，并使用固定 app 标识符覆盖旧通知，绝不堆叠轰炸
         if systemBannerEnabled && Bundle.main.bundleIdentifier != nil {
             let content = UNMutableNotificationContent()
-            let statusEmoji = (alert.status == .waiting) ? "🟠 待确认" : "✅ 任务已完成"
+            let statusEmoji: String
+            switch alert.status {
+            case .waiting: statusEmoji = "🟠 待确认"
+            case .error: statusEmoji = "❌ 任务异常"
+            default: statusEmoji = "✅ 任务已完成"
+            }
             content.title = "\(statusEmoji) · \(alert.appName)"
             content.subtitle = alert.workspace.isEmpty ? "" : "项目: \(alert.workspace)"
             content.body = "\(alert.taskTitle)\n👉 点击立即跳转到 \(alert.appName)"

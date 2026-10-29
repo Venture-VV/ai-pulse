@@ -58,7 +58,19 @@ struct NeuralWaveformView: View {
         }
         .frame(width: 18, height: 16)
         .onAppear {
-            animate = true
+            if isActive {
+                animate = true
+            }
+        }
+        .onChange(of: isActive) { active in
+            if active {
+                animate = false
+                DispatchQueue.main.async {
+                    animate = true
+                }
+            } else {
+                animate = false
+            }
         }
     }
 }
@@ -67,7 +79,6 @@ struct NeuralWaveformView: View {
 
 struct MainHUDView: View {
     @ObservedObject var engine: TelemetryEngine
-    @Binding var isMiniMode: Bool
     var onToggleMiniMode: () -> Void
     var onClosePanel: () -> Void
 
@@ -92,20 +103,21 @@ struct MainHUDView: View {
         engine.tasks.filter { $0.status == .completed }.count
     }
 
-    private var onlineCount: Int {
-        engine.tasks.filter { $0.isAppRunning }.count
-    }
-
     private var uniqueOnlineTasks: [AITaskItem] {
         var seen = Set<String>()
         var list: [AITaskItem] = []
         for t in engine.tasks where t.isAppRunning {
-            if !seen.contains(t.bundleId) {
-                seen.insert(t.bundleId)
+            let key = t.bundleId.isEmpty ? t.appName : t.bundleId
+            if !seen.contains(key) {
+                seen.insert(key)
                 list.append(t)
             }
         }
         return list
+    }
+
+    private var onlineCount: Int {
+        uniqueOnlineTasks.count
     }
 
     private var filteredTasks: [AITaskItem] {
@@ -144,7 +156,7 @@ struct MainHUDView: View {
 
     var body: some View {
         Group {
-            if isMiniMode {
+            if engine.isMiniMode {
                 miniCapsuleView
             } else {
                 expandedDashboardView
@@ -182,6 +194,20 @@ struct MainHUDView: View {
             NeuralWaveformView(isActive: runningCount > 0 || waitingCount > 0, color: ambientAuraColor)
 
             if let alert = engine.activeAlert {
+                let alertLabel: String = {
+                    switch alert.status {
+                    case .waiting: return "🟠 \(alert.appName) 等你拍板"
+                    case .error: return "❌ \(alert.appName) 有状况"
+                    default: return "✨ \(alert.appName) 已搞定"
+                    }
+                }()
+                let alertColor: Color = {
+                    switch alert.status {
+                    case .waiting: return .orange
+                    case .error: return Color(red: 1.0, green: 0.40, blue: 0.40)
+                    default: return Color(red: 0.25, green: 0.96, blue: 0.68)
+                    }
+                }()
                 Button(action: {
                     WindowActivator.shared.focusApp(
                         bundleId: alert.bundleId,
@@ -191,9 +217,9 @@ struct MainHUDView: View {
                     engine.activeAlert = nil
                 }) {
                     HStack(spacing: 6) {
-                        Text(alert.status == .waiting ? "🟠 \(alert.appName) 等你拍板" : "✨ \(alert.appName) 已搞定")
+                        Text(alertLabel)
                             .font(.system(size: 12, weight: .heavy, design: .rounded))
-                            .foregroundColor(alert.status == .waiting ? .orange : Color(red: 0.25, green: 0.96, blue: 0.68))
+                            .foregroundColor(alertColor)
                             .lineLimit(1)
                         Text("闪现 ↗")
                             .font(.system(size: 10.5, weight: .bold, design: .rounded))
@@ -529,7 +555,34 @@ struct MainHUDView: View {
     // MARK: - Completion Alert Banner
 
     private func completionBanner(_ alert: CompletionAlert) -> some View {
-        HStack(spacing: 10) {
+        let bannerTitle: String = {
+            switch alert.status {
+            case .waiting: return "🟠 等你拍板 · \(alert.appName)"
+            case .error: return "❌ 任务异常 · \(alert.appName)"
+            default: return "🎉 刚刚搞定 · \(alert.appName)"
+            }
+        }()
+        let bannerAccent: Color = {
+            switch alert.status {
+            case .waiting: return .orange
+            case .error: return Color(red: 1.0, green: 0.40, blue: 0.40)
+            default: return Color(red: 0.28, green: 0.98, blue: 0.68)
+            }
+        }()
+        let bannerBgColors: [Color] = {
+            if alert.status == .error {
+                return [
+                    Color(red: 0.36, green: 0.08, blue: 0.12).opacity(0.92),
+                    Color(red: 0.24, green: 0.06, blue: 0.10).opacity(0.92)
+                ]
+            }
+            return [
+                Color(red: 0.08, green: 0.32, blue: 0.24).opacity(0.92),
+                Color(red: 0.06, green: 0.18, blue: 0.26).opacity(0.92)
+            ]
+        }()
+
+        return HStack(spacing: 10) {
             Image(nsImage: AppIconCache.shared.icon(for: alert.appPath, bundleId: alert.bundleId))
                 .resizable()
                 .frame(width: 30, height: 30)
@@ -537,9 +590,9 @@ struct MainHUDView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
-                    Text(alert.status == .waiting ? "🟠 等你拍板 · \(alert.appName)" : "🎉 刚刚搞定 · \(alert.appName)")
+                    Text(bannerTitle)
                         .font(.system(size: 11.5, weight: .heavy, design: .rounded))
-                        .foregroundColor(alert.status == .waiting ? .orange : Color(red: 0.28, green: 0.98, blue: 0.68))
+                        .foregroundColor(bannerAccent)
                     if !alert.workspace.isEmpty {
                         Text("#\(alert.workspace)")
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -598,17 +651,14 @@ struct MainHUDView: View {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .fill(
                     LinearGradient(
-                        colors: [
-                            Color(red: 0.08, green: 0.32, blue: 0.24).opacity(0.92),
-                            Color(red: 0.06, green: 0.18, blue: 0.26).opacity(0.92)
-                        ],
+                        colors: bannerBgColors,
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        .strokeBorder(Color(red: 0.25, green: 0.95, blue: 0.65).opacity(0.65), lineWidth: 1.2)
+                        .strokeBorder(bannerAccent.opacity(0.65), lineWidth: 1.2)
                 )
         )
     }
@@ -1103,7 +1153,9 @@ struct TaskCardView: View {
                         LinearGradient(
                             colors: [
                                 item.justCompleted
-                                    ? Color(red: 0.12, green: 0.38, blue: 0.26).opacity(0.55)
+                                    ? (item.status == .error
+                                        ? Color(red: 0.42, green: 0.12, blue: 0.15).opacity(0.55)
+                                        : Color(red: 0.12, green: 0.38, blue: 0.26).opacity(0.55))
                                     : (isHovered ? item.brandColor.opacity(0.15) : Color.white.opacity(0.055)),
                                 Color.white.opacity(isHovered ? 0.06 : 0.025)
                             ],
@@ -1123,6 +1175,13 @@ struct TaskCardView: View {
 
     private var cardBorderGradient: LinearGradient {
         if item.justCompleted {
+            if item.status == .error {
+                return LinearGradient(
+                    colors: [Color.red.opacity(0.9), Color.orange.opacity(0.35)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
             return LinearGradient(
                 colors: [Color(red: 0.22, green: 0.95, blue: 0.65), Color.green.opacity(0.3)],
                 startPoint: .topLeading,
@@ -1151,7 +1210,17 @@ struct TaskCardView: View {
     }
 
     private var statusBadge: some View {
-        HStack(spacing: 4.5) {
+        let badgeText: String = {
+            guard item.justCompleted else { return item.status.label }
+            switch item.status {
+            case .completed: return "刚刚搞定"
+            case .error: return "刚刚报错"
+            case .waiting: return "等你拍板"
+            default: return item.status.label
+            }
+        }()
+
+        return HStack(spacing: 4.5) {
             if item.status == .running {
                 ProgressView()
                     .controlSize(.mini)
@@ -1163,7 +1232,7 @@ struct TaskCardView: View {
                     .frame(width: 6, height: 6)
             }
 
-            Text((item.justCompleted && item.status == .completed) ? "刚刚搞定" : item.status.label)
+            Text(badgeText)
                 .font(.system(size: 10.5, weight: .heavy, design: .rounded))
                 .foregroundColor(item.status.badgeColor)
         }

@@ -29,7 +29,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingHUDPanel!
     private let engine = TelemetryEngine()
     private var cancellables = Set<AnyCancellable>()
-    private var isMiniMode: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -46,36 +45,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let originY = screenFrame.maxY - initialSize.height - 12
 
         panel = FloatingHUDPanel(contentRect: NSRect(origin: NSPoint(x: originX, y: originY), size: initialSize))
-        updatePanelContent()
-        panel.orderFrontRegardless()
-    }
-
-    private func updatePanelContent() {
-        let miniBinding = Binding<Bool>(
-            get: { [weak self] in self?.isMiniMode ?? false },
-            set: { [weak self] newVal in
-                self?.setMiniMode(newVal)
-            }
-        )
-
         let rootView = MainHUDView(
             engine: engine,
-            isMiniMode: miniBinding,
             onToggleMiniMode: { [weak self] in
                 guard let self = self else { return }
-                self.setMiniMode(!self.isMiniMode)
+                self.setMiniMode(!self.engine.isMiniMode)
             },
             onClosePanel: { [weak self] in
                 self?.panel.orderOut(nil)
             }
         )
-
         panel.contentView = NSHostingView(rootView: rootView)
+        panel.orderFrontRegardless()
     }
 
     private func setMiniMode(_ mini: Bool) {
-        guard isMiniMode != mini else { return }
-        isMiniMode = mini
+        guard engine.isMiniMode != mini else { return }
+        engine.isMiniMode = mini
 
         let oldFrame = panel.frame
         let newSize = mini ? NSSize(width: 316, height: 50) : NSSize(width: 416, height: 610)
@@ -84,7 +70,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let newOriginY = oldFrame.maxY - newSize.height
         let newFrame = NSRect(origin: NSPoint(x: newOriginX, y: max(20, newOriginY)), size: newSize)
 
-        updatePanelContent()
         panel.setFrame(newFrame, display: true, animate: true)
     }
 
@@ -132,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggleItem)
 
         let miniItem = NSMenuItem(
-            title: isMiniMode ? "展开完整监控面板" : "切换为迷你胶囊模式",
+            title: engine.isMiniMode ? "展开完整监控面板" : "切换为迷你胶囊模式",
             action: #selector(menuToggleMini),
             keyEquivalent: "m"
         )
@@ -208,7 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
-        setMiniMode(!isMiniMode)
+        setMiniMode(!engine.isMiniMode)
     }
 
     @objc private func menuSimulateAlert() {
@@ -246,16 +231,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self, let button = self.statusItem.button else { return }
                 let running = tasks.filter { $0.status == .running }.count
                 let waiting = tasks.filter { $0.status == .waiting }.count
+                let justErrored = tasks.filter { $0.justCompleted && $0.status == .error }.count
                 let justDone = tasks.filter { $0.justCompleted }.count
 
                 if waiting > 0 {
                     button.title = "🟠 \(waiting) 待确认 · AI"
+                } else if justErrored > 0 {
+                    button.title = "❌ \(justErrored) 刚异常 · AI"
                 } else if justDone > 0 {
                     button.title = "🎉 \(justDone) 刚完成 · AI"
                 } else if running > 0 {
                     button.title = "⚡ \(running) 运行中 · AI"
                 } else {
-                    let online = tasks.filter { $0.isAppRunning }.count
+                    let online = Set(tasks.filter(\.isAppRunning).map { $0.bundleId.isEmpty ? $0.appName : $0.bundleId }).count
                     button.title = "✦ AI 监控 (\(online))"
                 }
             }
