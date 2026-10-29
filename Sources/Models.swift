@@ -39,6 +39,30 @@ enum TaskStatus: String, Codable, CaseIterable {
     }
 }
 
+extension Date {
+    /// 安全解析外部时间戳（支持秒或毫秒，过滤 NaN / Infinity 及不合理越界值，防止 Int(Double) 溢出崩溃）
+    static func safeFromTimestamp(_ raw: Double) -> Date? {
+        guard raw.isFinite, raw > 0 else { return nil }
+        let seconds = raw > 10_000_000_000 ? (raw / 1000.0) : raw
+        // 合理时间区间：2000-01-01 至 2100-01-01
+        guard seconds >= 946_684_800 && seconds <= 4_102_444_800 else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    var safeEpochSeconds: Int {
+        let raw = timeIntervalSince1970
+        guard raw.isFinite else { return 0 }
+        let clamped = min(max(raw, Double(Int.min / 2)), Double(Int.max / 2))
+        return Int(clamped)
+    }
+}
+
+private func safeClampedInt(_ value: Double, min minVal: Int = 0, max maxVal: Int = 86_400 * 3650) -> Int {
+    guard value.isFinite else { return minVal }
+    let clamped = Swift.min(Swift.max(value, Double(minVal)), Double(maxVal))
+    return Int(clamped)
+}
+
 enum ToolCategory: String, Codable {
     case ide = "AI IDE"
     case cli = "CLI 终端"
@@ -101,7 +125,7 @@ struct AITaskItem: Identifiable, Equatable {
     }
 
     var relativeTimeString: String {
-        let seconds = max(0, Int(Date().timeIntervalSince(updatedAt)))
+        let seconds = safeClampedInt(Date().timeIntervalSince(updatedAt), min: 0)
         if seconds < 5 { return "刚刚" }
         if seconds < 60 { return "\(seconds)s 前" }
         let minutes = seconds / 60
@@ -113,7 +137,7 @@ struct AITaskItem: Identifiable, Equatable {
 
     func elapsedDurationString(now: Date) -> String {
         let ref = startedAt ?? updatedAt
-        let total = max(1, Int(now.timeIntervalSince(ref)))
+        let total = safeClampedInt(now.timeIntervalSince(ref), min: 1)
         let mins = total / 60
         let secs = total % 60
         if mins >= 60 {
@@ -132,8 +156,8 @@ struct AITaskItem: Identifiable, Equatable {
         lhs.justCompleted == rhs.justCompleted &&
         lhs.completionSignature == rhs.completionSignature &&
         lhs.isAppRunning == rhs.isAppRunning &&
-        Int(lhs.cpuPercent) == Int(rhs.cpuPercent) &&
-        Int(lhs.updatedAt.timeIntervalSince1970) == Int(rhs.updatedAt.timeIntervalSince1970)
+        safeClampedInt(lhs.cpuPercent, min: 0, max: 100_000) == safeClampedInt(rhs.cpuPercent, min: 0, max: 100_000) &&
+        lhs.updatedAt.safeEpochSeconds == rhs.updatedAt.safeEpochSeconds
     }
 }
 

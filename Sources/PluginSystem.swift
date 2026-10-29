@@ -548,6 +548,16 @@ struct GrokBotProvider: AITaskProvider {
 
 // MARK: - 5. Zero-Code Drop-In Status Provider (~/.ai-pulse/status/*.json)
 
+func expandLeadingTilde(_ rawPath: String, homeDir: String) -> String {
+    if rawPath == "~" {
+        return homeDir
+    }
+    if rawPath.hasPrefix("~/") {
+        return homeDir + String(rawPath.dropFirst(1))
+    }
+    return rawPath
+}
+
 struct DropInStatusProvider: AITaskProvider {
     let providerId = "dropin-status"
     let displayName = "Drop-in Status API"
@@ -561,7 +571,10 @@ struct DropInStatusProvider: AITaskProvider {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
 
+        let fallbackTerm = TelemetryEngine.preferredTerminalApp(runningBundleIds: context.runningBundleIds)
         var items: [AITaskItem] = []
+        let now = Date()
+
         for file in files.sorted() where file.hasSuffix(".json") {
             let fullPath = "\(dir)/\(file)"
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: fullPath)),
@@ -569,11 +582,13 @@ struct DropInStatusProvider: AITaskProvider {
 
             let id = json["id"] as? String ?? "custom-\(file.dropLast(5))"
             let appName = json["appName"] as? String ?? "Custom Bot"
-            let bundleId = json["bundleId"] as? String ?? "com.apple.Terminal"
-            let appPath = json["appPath"] as? String ?? "/System/Applications/Utilities/Terminal.app"
+            let rawBundleId = json["bundleId"] as? String ?? ""
+            let rawAppPath = json["appPath"] as? String ?? ""
+            let bundleId = rawBundleId.isEmpty ? fallbackTerm.bundleId : rawBundleId
+            let appPath = rawAppPath.isEmpty ? fallbackTerm.appPath : expandLeadingTilde(rawAppPath, homeDir: context.homeDir)
             let taskTitle = json["taskTitle"] as? String ?? "自定义任务"
             let workspace = json["workspace"] as? String ?? "custom"
-            let fullWorkspacePath = json["fullWorkspacePath"] as? String ?? ""
+            let fullWorkspacePath = expandLeadingTilde(json["fullWorkspacePath"] as? String ?? "", homeDir: context.homeDir)
             let statusDetail = json["statusDetail"] as? String ?? "来自 ~/.ai-pulse/status 实时上报"
             let modelName = json["modelName"] as? String ?? "Custom Agent"
             let rawStatus = (json["status"] as? String ?? "completed").lowercased()
@@ -587,18 +602,29 @@ struct DropInStatusProvider: AITaskProvider {
             default: status = .completed
             }
 
+            let fileModDate = (try? fm.attributesOfItem(atPath: fullPath)[.modificationDate] as? Date) ?? now
             let modDate: Date
-            if let ts = json["updatedAt"] as? Double {
-                modDate = Date(timeIntervalSince1970: ts > 10_000_000_000 ? ts / 1000.0 : ts)
-            } else if let attrs = try? fm.attributesOfItem(atPath: fullPath),
-                      let fMod = attrs[.modificationDate] as? Date {
-                modDate = fMod
+            if let ts = json["updatedAt"] as? Double, let validDate = Date.safeFromTimestamp(ts) {
+                modDate = validDate
+            } else if let tsInt = json["updatedAt"] as? Int, let validDate = Date.safeFromTimestamp(Double(tsInt)) {
+                modDate = validDate
             } else {
-                modDate = Date()
+                modDate = fileModDate
             }
 
-            let sig = status == .running ? "" : (json["completionSignature"] as? String ?? "dropin-\(id)-\(status.rawValue)-\(Int(modDate.timeIntervalSince1970))")
+            // 已完成/空闲/异常的 Drop-in 状态文件默认保留 24 小时（可通过 ttlSeconds 自定义），防止旧卡片无限堆积
+            let ttlSeconds = (json["ttlSeconds"] as? Double) ?? 86_400.0
+            if (status == .completed || status == .idle || status == .error),
+               ttlSeconds.isFinite, ttlSeconds > 0,
+               now.timeIntervalSince(modDate) > ttlSeconds {
+                continue
+            }
+
+            let sig = status == .running ? "" : (json["completionSignature"] as? String ?? "dropin-\(id)-\(status.rawValue)-\(modDate.safeEpochSeconds)")
             let isOnline = (json["isAppRunning"] as? Bool) ?? (status == .running || status == .waiting || context.runningBundleIds.contains(bundleId))
+
+            let rawCpu = json["cpuPercent"] as? Double ?? 0.0
+            let safeCpu = (rawCpu.isFinite && rawCpu >= 0) ? min(rawCpu, 1000.0) : 0.0
 
             items.append(AITaskItem(
                 id: id,
@@ -612,7 +638,7 @@ struct DropInStatusProvider: AITaskProvider {
                 statusDetail: statusDetail,
                 modelName: modelName,
                 status: status,
-                cpuPercent: json["cpuPercent"] as? Double ?? 0.0,
+                cpuPercent: safeCpu,
                 updatedAt: modDate,
                 isAppRunning: isOnline,
                 completionSignature: sig,
@@ -647,13 +673,13 @@ struct DeclarativePluginProvider: AITaskProvider {
             let id = cfg["id"] as? String ?? "plugin-\(file.dropLast(5))"
             let appName = cfg["appName"] as? String ?? id
             let bundleId = cfg["bundleId"] as? String ?? ""
-            let appPath = (cfg["appPath"] as? String ?? "").replacingOccurrences(of: "~", with: context.homeDir)
+            let appPath = expandLeadingTilde(cfg["appPath"] as? String ?? "", homeDir: context.homeDir)
             let modelName = cfg["modelName"] as? String ?? appName
             let mode = (cfg["mode"] as? String ?? "json_file").lowercased()
             let isAppOnline = !bundleId.isEmpty && context.runningBundleIds.contains(bundleId)
 
             if mode == "json_file", let rawTarget = cfg["filePath"] as? String {
-                let targetPath = rawTarget.replacingOccurrences(of: "~", with: context.homeDir)
+                let targetPath = expandLeadingTilde(rawTarget, homeDir: context.homeDir)
                 guard let tData = try? Data(contentsOf: URL(fileURLWithPath: targetPath)),
                       let tJson = try? JSONSerialization.jsonObject(with: tData) as? [String: Any] else { continue }
 
@@ -665,7 +691,7 @@ struct DeclarativePluginProvider: AITaskProvider {
                 let title = (tJson[titleKey] as? String) ?? "\(appName) 任务"
                 let rawStatus = ((tJson[statusKey] as? String) ?? "completed").lowercased()
                 let detail = (tJson[detailKey] as? String) ?? "\(appName) 状态已同步"
-                let ws = (tJson[workspaceKey] as? String) ?? appName
+                let ws = expandLeadingTilde((tJson[workspaceKey] as? String) ?? appName, homeDir: context.homeDir)
 
                 let status: TaskStatus
                 switch rawStatus {
@@ -677,7 +703,7 @@ struct DeclarativePluginProvider: AITaskProvider {
                 }
 
                 let modDate = (try? fm.attributesOfItem(atPath: targetPath)[.modificationDate] as? Date) ?? Date()
-                let sig = status == .running ? "" : "plugin-\(id)-\(rawStatus)-\(Int(modDate.timeIntervalSince1970))"
+                let sig = status == .running ? "" : "plugin-\(id)-\(rawStatus)-\(modDate.safeEpochSeconds)"
 
                 items.append(AITaskItem(
                     id: "plugin-\(id)",
@@ -817,6 +843,35 @@ public enum StressTestRunner {
         print(String(format: "  ✓ Survived corrupted JSON files (%d valid tasks preserved) | ~5MB JSONL tail read in %.2fms", afterCorrupt.count, tailMs))
         if !tailReadOk || afterCorrupt.count != 100 || tailMs > 50.0 {
             print("  ✗ FAIL: Fuzzing or 5MB tail read failed")
+            allPassed = false
+        }
+
+        // 尾部读取的起点落在中文（3 字节 UTF-8）字符中间时仍须读出内容：连续 3 个窗口大小中必有 2 个截在字符中间
+        let cjkLogPath = "\(tempDir)/cjk_session.jsonl"
+        try? (String(repeating: "中文转录", count: 1000) + "\n" + sampleLine).write(toFile: cjkLogPath, atomically: true, encoding: .utf8)
+        let cjkTailOk = (UInt64(1000)...UInt64(1002)).allSatisfy { engine.stressTestTailRead(path: cjkLogPath, maxBytes: $0) }
+        if cjkTailOk {
+            print("  ✓ Tail read starting inside a multi-byte UTF-8 (CJK) character still decodes")
+        } else {
+            print("  ✗ FAIL: Tail read starting inside a multi-byte UTF-8 (CJK) character returned nil")
+            allPassed = false
+        }
+
+        // 校验越界时间戳（如 1e300）、过期已完成状态文件清理、开头的 ~ 展开及 UTF-16LE 缓冲区末尾冲刷
+        try? "{\"id\":\"extreme-ts\",\"taskTitle\":\"极端时间戳\",\"status\":\"running\",\"updatedAt\":1e300}".write(
+            toFile: "\(tempDir)/extreme_ts.json", atomically: true, encoding: .utf8
+        )
+        let staleEpoch = Date().addingTimeInterval(-172_800).timeIntervalSince1970
+        try? "{\"id\":\"stale-done\",\"taskTitle\":\"过期已完成任务\",\"status\":\"completed\",\"updatedAt\":\(staleEpoch)}".write(
+            toFile: "\(tempDir)/stale_done.json", atomically: true, encoding: .utf8
+        )
+        let afterEdgeCases = DropInStatusProvider().scan(context: ctx)
+        let tildeOk = expandLeadingTilde("~/foo~bar/baz", homeDir: "/Users/test") == "/Users/test/foo~bar/baz"
+        let utf16FlushOk = engine.stressTestUTF16TrailingFlush()
+        if afterEdgeCases.count == 101 && tildeOk && utf16FlushOk {
+            print("  ✓ Extreme timestamp (1e300), 24h TTL expiry, leading-only '~' expansion, and UTF-16LE tail flush verified")
+        } else {
+            print("  ✗ FAIL: Edge cases failed (count=\(afterEdgeCases.count), tilde=\(tildeOk), utf16Flush=\(utf16FlushOk))")
             allPassed = false
         }
 

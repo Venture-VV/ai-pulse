@@ -38,8 +38,8 @@ class AIPulseTask:
         workspace: str = "default",
         full_workspace_path: str = "",
         model_name: str = "Custom-LLM",
-        bundle_id: str = "com.apple.Terminal",
-        app_path: str = "/System/Applications/Utilities/Terminal.app",
+        bundle_id: str = "",
+        app_path: str = "",
     ):
         self.task_id = task_id
         self.app_name = app_name
@@ -51,7 +51,11 @@ class AIPulseTask:
         self.app_path = app_path
         self.status_dir = Path.home() / ".ai-pulse" / "status"
         self.status_dir.mkdir(parents=True, exist_ok=True)
-        self.file_path = self.status_dir / f"{self.task_id}.json"
+        safe_file_id = (
+            self.task_id.replace("/", "_").replace("\\", "_").replace("..", "_").strip("._")
+            or "custom-task"
+        )
+        self.file_path = self.status_dir / f"{safe_file_id}.json"
 
     def update(
         self,

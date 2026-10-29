@@ -23,21 +23,45 @@ STATUS_DIR="${HOME}/.ai-pulse/status"
 mkdir -p "${STATUS_DIR}"
 
 NOW_SEC=$(date +%s)
-TARGET_FILE="${STATUS_DIR}/${TASK_ID}.json"
+SAFE_FILE_ID="${TASK_ID//\//_}"
+SAFE_FILE_ID="${SAFE_FILE_ID//../_}"
+if [ -z "${SAFE_FILE_ID}" ] || [ "${SAFE_FILE_ID}" = "." ]; then
+  SAFE_FILE_ID="custom-task"
+fi
+TARGET_FILE="${STATUS_DIR}/${SAFE_FILE_ID}.json"
 TMP_FILE="${TARGET_FILE}.tmp"
+
+# 转义为 JSON 字符串内容：标题里的 " 或 \ 会让文件无法解析，AI Pulse 会直接跳过该任务
+# 逐字符处理以兼容 macOS 自带的 bash 3.2（${var//…} 替换中的反斜杠语义在各版本间不一致）
+json_escape() {
+  local s="$1" out="" c i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      \\) out+="\\\\" ;;
+      \") out+='\"' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      [[:cntrl:]]) ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
 
 cat > "${TMP_FILE}" <<EOF
 {
-  "id": "${TASK_ID}",
-  "appName": "${APP_NAME}",
-  "bundleId": "com.apple.Terminal",
-  "appPath": "/System/Applications/Utilities/Terminal.app",
-  "taskTitle": "${TITLE}",
-  "workspace": "${WORKSPACE}",
-  "fullWorkspacePath": "${PWD}",
-  "statusDetail": "${DETAIL}",
-  "modelName": "${MODEL}",
-  "status": "${STATUS}",
+  "id": "$(json_escape "${TASK_ID}")",
+  "appName": "$(json_escape "${APP_NAME}")",
+  "bundleId": "",
+  "appPath": "",
+  "taskTitle": "$(json_escape "${TITLE}")",
+  "workspace": "$(json_escape "${WORKSPACE}")",
+  "fullWorkspacePath": "$(json_escape "${PWD}")",
+  "statusDetail": "$(json_escape "${DETAIL}")",
+  "modelName": "$(json_escape "${MODEL}")",
+  "status": "$(json_escape "${STATUS}")",
   "updatedAt": ${NOW_SEC},
   "isAppRunning": true
 }

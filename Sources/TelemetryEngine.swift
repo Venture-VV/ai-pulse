@@ -6,24 +6,46 @@ final class TelemetryEngine: ObservableObject {
     @Published var tasks: [AITaskItem] = []
     @Published var activeAlert: CompletionAlert? = nil
     @Published var recentAlerts: [CompletionAlert] = []
+    @Published var isMiniMode: Bool = false
 
-    // 提醒偏好设置（默认关闭系统通知轰炸，仅使用悬浮窗内横幅 + 轻柔提示音 + 前台应用免打扰）
-    @Published var soundEnabled: Bool = true
-    @Published var voiceEnabled: Bool = false
+    private var persistPreferences: Bool = false
+
+    // 提醒偏好设置（默认关闭系统通知轰炸，仅使用悬浮窗内横幅 + 轻柔提示音 + 前台应用免打扰，支持 UserDefaults 持久化）
+    @Published var soundEnabled: Bool = true {
+        didSet {
+            if persistPreferences { UserDefaults.standard.set(soundEnabled, forKey: "aipulse.soundEnabled") }
+        }
+    }
+    @Published var voiceEnabled: Bool = false {
+        didSet {
+            if persistPreferences { UserDefaults.standard.set(voiceEnabled, forKey: "aipulse.voiceEnabled") }
+        }
+    }
     @Published var systemBannerEnabled: Bool = false {
         didSet {
+            if persistPreferences { UserDefaults.standard.set(systemBannerEnabled, forKey: "aipulse.systemBannerEnabled") }
             if systemBannerEnabled {
                 WindowActivator.shared.requestNotificationPermissionIfNeeded()
             }
         }
     }
-    @Published var muteFrontmostApp: Bool = true
-    @Published var doNotDisturbEnabled: Bool = false
+    @Published var muteFrontmostApp: Bool = true {
+        didSet {
+            if persistPreferences { UserDefaults.standard.set(muteFrontmostApp, forKey: "aipulse.muteFrontmostApp") }
+        }
+    }
+    @Published var doNotDisturbEnabled: Bool = false {
+        didSet {
+            if persistPreferences { UserDefaults.standard.set(doNotDisturbEnabled, forKey: "aipulse.doNotDisturbEnabled") }
+        }
+    }
     @Published var lastScanTime: Date = Date()
 
     private var timer: Timer?
     private var alertAutoDismissWorkItem: DispatchWorkItem?
     private let queue = DispatchQueue(label: "com.aipulse.telemetry", qos: .utility)
+    private let scanLock = NSLock()
+    private var isScanInFlight: Bool = false
 
     // 防抖与防轰炸状态追踪
     private var previousStatuses: [String: TaskStatus] = [:]
@@ -36,14 +58,31 @@ final class TelemetryEngine: ObservableObject {
 
     init(autoStart: Bool = true) {
         if autoStart {
+            let defaults = UserDefaults.standard
+            if defaults.object(forKey: "aipulse.soundEnabled") != nil {
+                soundEnabled = defaults.bool(forKey: "aipulse.soundEnabled")
+            }
+            if defaults.object(forKey: "aipulse.voiceEnabled") != nil {
+                voiceEnabled = defaults.bool(forKey: "aipulse.voiceEnabled")
+            }
+            if defaults.object(forKey: "aipulse.systemBannerEnabled") != nil {
+                systemBannerEnabled = defaults.bool(forKey: "aipulse.systemBannerEnabled")
+            }
+            if defaults.object(forKey: "aipulse.muteFrontmostApp") != nil {
+                muteFrontmostApp = defaults.bool(forKey: "aipulse.muteFrontmostApp")
+            }
+            if defaults.object(forKey: "aipulse.doNotDisturbEnabled") != nil {
+                doNotDisturbEnabled = defaults.bool(forKey: "aipulse.doNotDisturbEnabled")
+            }
+            persistPreferences = true
             startMonitoring()
         }
     }
 
     func startMonitoring() {
-        scanNow()
+        scanNow(force: true)
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.scanNow()
+            self?.scanNow(force: false)
         }
         if let t = timer {
             RunLoop.main.add(t, forMode: .common)
@@ -60,7 +99,7 @@ final class TelemetryEngine: ObservableObject {
                 appPath: app.bundleURL?.path ?? ""
             )
         }
-        var items = performFullScan(runningApps: runningAppsSnapshot)
+        var items = deduplicateTasks(performFullScan(runningApps: runningAppsSnapshot))
         items.sort { a, b in
             if a.status.sortPriority != b.status.sortPriority {
                 return a.status.sortPriority < b.status.sortPriority
@@ -73,7 +112,15 @@ final class TelemetryEngine: ObservableObject {
         return items
     }
 
-    func scanNow() {
+    func scanNow(force: Bool = false) {
+        scanLock.lock()
+        if isScanInFlight && !force {
+            scanLock.unlock()
+            return
+        }
+        isScanInFlight = true
+        scanLock.unlock()
+
         let frontmostBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
         let runningAppsSnapshot = NSWorkspace.shared.runningApplications.map { app in
             RunningAppInfo(
@@ -90,6 +137,9 @@ final class TelemetryEngine: ObservableObject {
             DispatchQueue.main.async {
                 self.processScannedTasks(scanned, frontmostBundleId: frontmostBundleId)
                 self.lastScanTime = Date()
+                self.scanLock.lock()
+                self.isScanInFlight = false
+                self.scanLock.unlock()
             }
         }
     }
@@ -152,14 +202,36 @@ final class TelemetryEngine: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: work)
     }
 
+    /// 按 id 去重（若多个数据源产生相同 id，保留状态优先级更高或更新时间更新的项）
+    private func deduplicateTasks(_ list: [AITaskItem]) -> [AITaskItem] {
+        var byId: [String: Int] = [:]
+        var result: [AITaskItem] = []
+        for item in list {
+            if let existingIdx = byId[item.id] {
+                let existing = result[existingIdx]
+                if item.status.sortPriority < existing.status.sortPriority ||
+                   (item.status.sortPriority == existing.status.sortPriority && item.updatedAt > existing.updatedAt) {
+                    result[existingIdx] = item
+                }
+            } else {
+                byId[item.id] = result.count
+                result.append(item)
+            }
+        }
+        return result
+    }
+
     private func processScannedTasks(_ newTasks: [AITaskItem], frontmostBundleId: String) {
+        let dedupedTasks = deduplicateTasks(newTasks)
         var updatedList: [AITaskItem] = []
         let now = Date()
 
-        for var item in newTasks {
+        for var item in dedupedTasks {
+            let isTerminalAlertableStatus = (item.status == .completed || item.status == .waiting || item.status == .error)
+
             if isFirstScan {
                 previousStatuses[item.id] = item.status
-                if !item.completionSignature.isEmpty && (item.status == .completed || item.status == .waiting) {
+                if !item.completionSignature.isEmpty && isTerminalAlertableStatus {
                     notifiedSignatures[item.id] = item.completionSignature
                 }
                 if item.status == .running {
@@ -179,7 +251,7 @@ final class TelemetryEngine: ObservableObject {
                 item.startedAt = runningStartTimes[item.id]
             }
 
-            if prevStatus == .running && (item.status == .completed || item.status == .waiting) {
+            if prevStatus == .running && isTerminalAlertableStatus {
                 let runDuration = runningStartTimes[item.id].map { now.timeIntervalSince($0) } ?? 0
                 runningStartTimes[item.id] = nil
 
@@ -216,14 +288,14 @@ final class TelemetryEngine: ObservableObject {
                 }
             } else if item.status != .running {
                 runningStartTimes[item.id] = nil
-                if !item.completionSignature.isEmpty && (item.status == .completed || item.status == .waiting) {
+                if !item.completionSignature.isEmpty && isTerminalAlertableStatus {
                     notifiedSignatures[item.id] = item.completionSignature
                 }
             }
 
             if let compTime = recentCompletionTimestamps[item.id],
                now.timeIntervalSince(compTime) < 35,
-               (item.status == .completed || item.status == .waiting) {
+               isTerminalAlertableStatus {
                 item.justCompleted = true
             }
 
@@ -261,6 +333,47 @@ final class TelemetryEngine: ObservableObject {
     private struct ProcessMetrics {
         var cpuByKeyword: [String: Double] = [:]
         var cliTasks: [(pid: Int, tty: String, cpu: Double, cmd: String)] = []
+        var parentMap: [Int: (ppid: Int, comm: String)] = [:]
+    }
+
+    static func preferredTerminalApp(runningBundleIds: Set<String>) -> (bundleId: String, appPath: String) {
+        let candidates: [(bundleId: String, appPath: String)] = [
+            ("com.googlecode.iterm2", "/Applications/iTerm.app"),
+            ("dev.warp.Warp-Stable", "/Applications/Warp.app"),
+            ("com.mitchellh.ghostty", "/Applications/Ghostty.app"),
+            ("net.kovidgoyal.kitty", "/Applications/kitty.app"),
+            ("io.alacritty", "/Applications/Alacritty.app"),
+            ("com.apple.Terminal", "/System/Applications/Utilities/Terminal.app")
+        ]
+        for c in candidates where runningBundleIds.contains(c.bundleId) {
+            return c
+        }
+        return ("com.apple.Terminal", "/System/Applications/Utilities/Terminal.app")
+    }
+
+    private func resolveTerminalApp(forPid startPid: Int, parentMap: [Int: (ppid: Int, comm: String)], runningApps: [RunningAppInfo]) -> (bundleId: String, appPath: String) {
+        let knownTerminals: [(keyword: String, bundleId: String, appPath: String)] = [
+            ("iterm", "com.googlecode.iterm2", "/Applications/iTerm.app"),
+            ("warp", "dev.warp.Warp-Stable", "/Applications/Warp.app"),
+            ("ghostty", "com.mitchellh.ghostty", "/Applications/Ghostty.app"),
+            ("kitty", "net.kovidgoyal.kitty", "/Applications/kitty.app"),
+            ("alacritty", "io.alacritty", "/Applications/Alacritty.app"),
+            ("cursor.app", "com.todesktop.230313mzl4w4u92", "/Applications/Cursor.app"),
+            ("antigravity.app", "com.google.antigravity", "/Applications/Antigravity.app"),
+            ("kimi code.app", "com.kimi.code.desktop", "/Applications/Kimi Code.app"),
+            ("visual studio code.app", "com.microsoft.VSCode", "/Applications/Visual Studio Code.app"),
+            ("terminal.app", "com.apple.Terminal", "/System/Applications/Utilities/Terminal.app")
+        ]
+        var cur = startPid
+        for _ in 0..<12 {
+            guard let info = parentMap[cur], info.ppid > 1, info.ppid != cur else { break }
+            let lowerComm = info.comm.lowercased()
+            for term in knownTerminals where lowerComm.contains(term.keyword) {
+                return (term.bundleId, term.appPath)
+            }
+            cur = info.ppid
+        }
+        return Self.preferredTerminalApp(runningBundleIds: Set(runningApps.map { $0.bundleId }))
     }
 
     private func performFullScan(runningApps: [RunningAppInfo]) -> [AITaskItem] {
@@ -305,7 +418,7 @@ final class TelemetryEngine: ObservableObject {
         results.append(contentsOf: scanOtherIDEs(runningApps: runningApps, procMetrics: procMetrics))
 
         // 10. 终端独立 CLI Agent 进程
-        results.append(contentsOf: scanTerminalCLITasks(cliList: procMetrics.cliTasks))
+        results.append(contentsOf: scanTerminalCLITasks(cliList: procMetrics.cliTasks, parentMap: procMetrics.parentMap, runningApps: runningApps))
 
         return results
     }
@@ -316,7 +429,7 @@ final class TelemetryEngine: ObservableObject {
         var metrics = ProcessMetrics()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-axo", "pid=,pcpu=,tty=,comm="]
+        proc.arguments = ["-axo", "pid=,ppid=,pcpu=,tty=,comm="]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
@@ -329,48 +442,54 @@ final class TelemetryEngine: ObservableObject {
 
             for line in output.split(separator: "\n") {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                let parts = trimmed.split(maxSplits: 3, omittingEmptySubsequences: true, whereSeparator: { $0 == " " || $0 == "\t" })
-                guard parts.count == 4 else { continue }
+                let parts = trimmed.split(maxSplits: 4, omittingEmptySubsequences: true, whereSeparator: { $0 == " " || $0 == "\t" })
+                guard parts.count == 5 else { continue }
                 let pid = Int(parts[0]) ?? 0
-                let cpu = Double(parts[1]) ?? 0.0
-                let tty = String(parts[2])
-                let comm = String(parts[3])
+                let ppid = Int(parts[1]) ?? 0
+                let cpu = Double(parts[2]) ?? 0.0
+                let tty = String(parts[3])
+                let comm = String(parts[4])
                 let lower = comm.lowercased()
+                let baseName = (comm as NSString).lastPathComponent.lowercased()
 
-                if lower.contains("antigravity") || lower.contains("language_server") {
+                if pid > 0 {
+                    metrics.parentMap[pid] = (ppid: ppid, comm: comm)
+                }
+
+                if lower.contains("antigravity") || baseName.hasPrefix("language_server") {
                     metrics.cpuByKeyword["antigravity", default: 0] += cpu
                 }
-                if lower.contains("cursor") {
+                if lower.contains("cursor.app") || baseName == "cursor" {
                     metrics.cpuByKeyword["cursor", default: 0] += cpu
                 }
-                if lower.contains("opencode") {
+                if lower.contains("opencode") || baseName == "opencode" {
                     metrics.cpuByKeyword["opencode", default: 0] += cpu
                 }
-                if lower.contains("chatgpt") || lower.contains("codex") {
+                if lower.contains("chatgpt.app") || lower.contains("codex") || baseName == "codex" {
                     metrics.cpuByKeyword["codex", default: 0] += cpu
                 }
-                if lower.contains("claude") {
+                if lower.contains("claude.app") || baseName == "claude" {
                     metrics.cpuByKeyword["claude", default: 0] += cpu
                 }
-                if lower.contains("kimi") {
+                if lower.contains("kimi code.app") || lower.contains("kimi-code") || baseName == "kimi" {
                     metrics.cpuByKeyword["kimi", default: 0] += cpu
                 }
-                if lower.contains("workbuddy") {
+                if lower.contains("workbuddy.app") || baseName == "workbuddy" {
                     metrics.cpuByKeyword["workbuddy", default: 0] += cpu
                 }
-                if lower.contains("manus") {
+                if lower.contains("manus studio.app") || baseName == "manus" {
                     metrics.cpuByKeyword["manus", default: 0] += cpu
                 }
-                if lower.contains("deepseek") || lower.contains("dsh") {
+                if lower.contains("deepseek") || baseName == "dsh" {
                     metrics.cpuByKeyword["deepseek", default: 0] += cpu
                 }
-                if lower.contains("grok") || lower.contains("sand") {
+                if lower.contains("grok bot.app") || lower.contains(".grok") || baseName == "grok" || baseName == "grok bot" {
                     metrics.cpuByKeyword["grok", default: 0] += cpu
                 }
-                if lower.contains("trae") {
+                if lower.contains("trae.app") || baseName == "trae" {
                     metrics.cpuByKeyword["trae", default: 0] += cpu
                 }
-                if lower.contains("codebuddy") {
+                if lower.contains("codebuddy.app") || baseName == "codebuddy" {
                     metrics.cpuByKeyword["codebuddy", default: 0] += cpu
                 }
                 if lower.contains("visual studio code") || lower.contains("code helper") || lower.contains("copilot") {
@@ -378,8 +497,7 @@ final class TelemetryEngine: ObservableObject {
                 }
 
                 if tty != "??" && tty.hasPrefix("ttys") {
-                    let baseName = (comm as NSString).lastPathComponent.lowercased()
-                    if ["claude", "aider", "gemini", "kimi", "codex", "opencode"].contains(baseName) {
+                    if ["claude", "aider", "gemini", "kimi", "codex", "opencode", "grok"].contains(baseName) {
                         metrics.cliTasks.append((pid: pid, tty: tty, cpu: cpu, cmd: baseName))
                     }
                 }
@@ -517,9 +635,14 @@ final class TelemetryEngine: ObservableObject {
     // MARK: - 2. ChatGPT / Codex Scanner
 
     private func scanCodex(runningApps: [RunningAppInfo], cpu: Double) -> [AITaskItem] {
-        let bundleId = "com.openai.codex"
-        let appPath = "/Applications/ChatGPT.app"
-        let isRunning = runningApps.contains(where: { $0.bundleId == bundleId }) || cpu > 0.1
+        let codexCandidates = ["com.openai.codex", "com.openai.chat"]
+        let runningMatch = runningApps.first(where: { codexCandidates.contains($0.bundleId) })
+        let bundleId = runningMatch?.bundleId ?? "com.openai.codex"
+        let defaultPath = FileManager.default.fileExists(atPath: "/Applications/Codex.app")
+            ? "/Applications/Codex.app"
+            : "/Applications/ChatGPT.app"
+        let appPath = (runningMatch?.appPath.isEmpty == false) ? runningMatch!.appPath : defaultPath
+        let isRunning = (runningMatch != nil) || cpu > 0.1
         let stateDbPath = "\(homeDir)/.codex/state_5.sqlite"
         let historyDbPath = "\(homeDir)/.codex/thread_history_1.sqlite"
 
@@ -579,13 +702,14 @@ final class TelemetryEngine: ObservableObject {
                     let turnSql = """
                     SELECT turn_id, status, IFNULL(started_at, 0), IFNULL(completed_at, 0)
                     FROM thread_turns
-                    WHERE thread_id = '\(tid)'
+                    WHERE thread_id = ?
                     ORDER BY rollout_ordinal DESC
                     LIMIT 1;
                     """
                     var turnStmt: OpaquePointer?
                     if sqlite3_prepare_v2(hdb, turnSql, -1, &turnStmt, nil) == SQLITE_OK {
                         defer { sqlite3_finalize(turnStmt) }
+                        sqlite3_bind_text(turnStmt, 1, (tid as NSString).utf8String, -1, nil)
                         if sqlite3_step(turnStmt) == SQLITE_ROW {
                             let turnId = columnString(turnStmt, 0)
                             let turnStatus = columnString(turnStmt, 1)
@@ -607,13 +731,15 @@ final class TelemetryEngine: ObservableObject {
                             let itemSql = """
                             SELECT item_type, item_json
                             FROM thread_items
-                            WHERE thread_id = '\(tid)' AND turn_id = '\(turnId)'
+                            WHERE thread_id = ? AND turn_id = ?
                             ORDER BY rollout_ordinal DESC
                             LIMIT 8;
                             """
                             var itemStmt: OpaquePointer?
                             if sqlite3_prepare_v2(hdb, itemSql, -1, &itemStmt, nil) == SQLITE_OK {
                                 defer { sqlite3_finalize(itemStmt) }
+                                sqlite3_bind_text(itemStmt, 1, (tid as NSString).utf8String, -1, nil)
+                                sqlite3_bind_text(itemStmt, 2, (turnId as NSString).utf8String, -1, nil)
                                 while sqlite3_step(itemStmt) == SQLITE_ROW {
                                     let iType = columnString(itemStmt, 0)
                                     let iJson = columnString(itemStmt, 1)
@@ -749,7 +875,8 @@ final class TelemetryEngine: ObservableObject {
             "tool.call.started", "tool.result", "task.started"
         ]
         let turnDoneEvents: Set<String> = [
-            "turn.ended", "prompt.completed", "compaction.completed"
+            "turn.ended", "prompt.completed", "compaction.completed",
+            "prompt.aborted", "turn.step.interrupted", "error", "compaction.blocked"
         ]
 
         if let eventFiles = try? fm.contentsOfDirectory(atPath: eventsDir) {
@@ -796,6 +923,7 @@ final class TelemetryEngine: ObservableObject {
 
                 var lastLifecycleSeq: Int = 0
                 var lastLifecycleEvent: String = ""
+                var pendingApprovalEvent: String = ""
                 var lastStep: Int = 0
                 var lastToolName: String = ""
                 var lastToolDesc: String = ""
@@ -823,6 +951,16 @@ final class TelemetryEngine: ObservableObject {
 
                     if turnActiveEvents.contains(evType) || turnDoneEvents.contains(evType) {
                         lastLifecycleEvent = evType
+                        lastLifecycleSeq = seq
+                        pendingApprovalEvent = ""
+                        workChangedMainActive = nil
+                        workChangedPendingInteraction = "none"
+                    }
+
+                    if (evType.contains("approval") || evType.contains("permission"))
+                        && !evType.hasSuffix(".resolved")
+                        && !evType.hasSuffix(".completed") {
+                        pendingApprovalEvent = evType
                         lastLifecycleSeq = seq
                     }
 
@@ -860,7 +998,11 @@ final class TelemetryEngine: ObservableObject {
                             lastNotifyTitle = nTitle
                         }
                     } else if turnDoneEvents.contains(evType) {
-                        lastEndReason = payload["reason"] as? String ?? "completed"
+                        if evType == "error" {
+                            lastEndReason = "error"
+                        } else {
+                            lastEndReason = payload["reason"] as? String ?? "completed"
+                        }
                         lastToolName = ""
                         lastToolDesc = ""
                     }
@@ -882,24 +1024,22 @@ final class TelemetryEngine: ObservableObject {
                 let detail: String
                 let sig: String
 
-                if workChangedPendingInteraction != "none" && !workChangedPendingInteraction.isEmpty && ageSec < 600 {
+                if (workChangedPendingInteraction != "none" && !workChangedPendingInteraction.isEmpty && ageSec < 600)
+                    || (!pendingApprovalEvent.isEmpty && ageSec < 600) {
                     status = .waiting
-                    detail = "Kimi Code 等待您的确认 (\(workChangedPendingInteraction))"
+                    let reasonLabel = !pendingApprovalEvent.isEmpty ? pendingApprovalEvent : workChangedPendingInteraction
+                    detail = "Kimi Code 等待您的确认或授权 (\(reasonLabel))"
                     sig = "kimi-wait-\(info.sid)-\(lastLifecycleSeq)"
-                } else if turnDoneEvents.contains(lastLifecycleEvent) || workChangedMainActive == false {
-                    if lastEndReason == "error" || lastEndReason == "failed" {
+                } else if turnDoneEvents.contains(lastLifecycleEvent) || (workChangedMainActive == false && !turnActiveEvents.contains(lastLifecycleEvent)) {
+                    if lastLifecycleEvent == "error" || lastEndReason == "error" || lastEndReason == "failed" {
                         status = .error
-                        detail = "Kimi Code 任务异常结束 (\(lastEndReason))"
+                        detail = "Kimi Code 任务异常结束 (\(lastEndReason.isEmpty ? "error" : lastEndReason))"
                         sig = "kimi-err-\(info.sid)-\(lastLifecycleSeq)"
                     } else {
                         status = .completed
                         detail = lastStep > 0 ? "已完成本轮任务 (共 \(lastStep) 步)" : "Kimi Code 任务已完成"
                         sig = "kimi-done-\(info.sid)-\(lastLifecycleSeq)"
                     }
-                } else if lastLifecycleEvent.contains("approval") || lastLifecycleEvent.contains("permission") {
-                    status = .waiting
-                    detail = "Kimi Code 等待您的确认或授权"
-                    sig = "kimi-wait-\(info.sid)-\(lastLifecycleSeq)"
                 } else if (turnActiveEvents.contains(lastLifecycleEvent) || workChangedMainActive == true) && ageSec < 300 && isRunning {
                     status = .running
                     let stepPrefix = lastStep > 0 ? "Step \(lastStep) · " : ""
@@ -1301,6 +1441,12 @@ final class TelemetryEngine: ObservableObject {
                 }
                 i += 2
             }
+            if chars.count >= 6 && cjkCount >= 5 && hi80Count >= 3 {
+                let str = String(chars).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !str.isEmpty {
+                    positioned.append((pos: startPos, text: str))
+                }
+            }
         }
         positioned.sort { $0.pos < $1.pos }
         return positioned.map { $0.text }
@@ -1361,10 +1507,12 @@ final class TelemetryEngine: ObservableObject {
                         }
 
                         var isGeneratingInDb = false
-                        let kvSql = "SELECT value FROM cursorDiskKV WHERE key = 'composerData:\(cid)' LIMIT 1;"
+                        let kvSql = "SELECT value FROM cursorDiskKV WHERE key = ? LIMIT 1;"
                         var kvStmt: OpaquePointer?
                         if sqlite3_prepare_v2(db, kvSql, -1, &kvStmt, nil) == SQLITE_OK {
                             defer { sqlite3_finalize(kvStmt) }
+                            let kvKey = "composerData:\(cid)"
+                            sqlite3_bind_text(kvStmt, 1, (kvKey as NSString).utf8String, -1, nil)
                             if sqlite3_step(kvStmt) == SQLITE_ROW {
                                 let kvVal = columnString(kvStmt, 0)
                                 if let kvData = kvVal.data(using: .utf8),
@@ -1541,20 +1689,25 @@ final class TelemetryEngine: ObservableObject {
                 var lastMsgSeq: Int64 = 0
                 var lastMsgType = "idle"
                 var lastMsgCreated: Int64 = timeUpdated
-                let msgSql = "SELECT seq, type, time_created FROM session_message WHERE session_id = '\(sid)' ORDER BY seq DESC LIMIT 1;"
+                var lastMsgCompleted = true
+                let msgSql = "SELECT seq, type, time_created, json_extract(data, '$.time.completed') FROM session_message WHERE session_id = ? ORDER BY seq DESC LIMIT 1;"
                 var msgStmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, msgSql, -1, &msgStmt, nil) == SQLITE_OK {
                     defer { sqlite3_finalize(msgStmt) }
+                    sqlite3_bind_text(msgStmt, 1, (sid as NSString).utf8String, -1, nil)
                     if sqlite3_step(msgStmt) == SQLITE_ROW {
                         lastMsgSeq = sqlite3_column_int64(msgStmt, 0)
                         lastMsgType = columnString(msgStmt, 1)
                         lastMsgCreated = sqlite3_column_int64(msgStmt, 2)
+                        lastMsgCompleted = (sqlite3_column_type(msgStmt, 3) != SQLITE_NULL)
                     }
                 }
 
                 let updatedDate = Date(timeIntervalSince1970: TimeInterval(max(timeUpdated, lastMsgCreated)) / 1000.0)
                 let ageSec = Date().timeIntervalSince(updatedDate)
-                let isSessionBusy = pendingSessions.contains(sid) || (lastMsgType != "idle" && ageSec < 1800 && isRunning)
+                let hasActivePending = pendingSessions.contains(sid) && ageSec < 300 && isRunning
+                let hasUnfinishedTurn = (lastMsgType != "idle" && !lastMsgCompleted && timeIdle < lastMsgCreated && ageSec < 120 && isRunning)
+                let isSessionBusy = hasActivePending || hasUnfinishedTurn
 
                 let status: TaskStatus
                 let detail: String
@@ -1706,14 +1859,19 @@ final class TelemetryEngine: ObservableObject {
 
     // MARK: - 10. Terminal CLI Agents
 
-    private func scanTerminalCLITasks(cliList: [(pid: Int, tty: String, cpu: Double, cmd: String)]) -> [AITaskItem] {
+    private func scanTerminalCLITasks(
+        cliList: [(pid: Int, tty: String, cpu: Double, cmd: String)],
+        parentMap: [Int: (ppid: Int, comm: String)],
+        runningApps: [RunningAppInfo]
+    ) -> [AITaskItem] {
         var results: [AITaskItem] = []
         for cli in cliList {
+            let termApp = resolveTerminalApp(forPid: cli.pid, parentMap: parentMap, runningApps: runningApps)
             results.append(AITaskItem(
                 id: "cli-\(cli.tty)-\(cli.cmd)",
                 appName: "终端 CLI (\(cli.cmd))",
-                bundleId: "com.apple.Terminal",
-                appPath: "/System/Applications/Utilities/Terminal.app",
+                bundleId: termApp.bundleId,
+                appPath: termApp.appPath,
                 category: .cli,
                 taskTitle: "终端运行中: \(cli.cmd) (PID \(cli.pid))",
                 workspace: cli.tty,
@@ -1760,7 +1918,9 @@ final class TelemetryEngine: ObservableObject {
             let startOffset = end > maxBytes ? (end - maxBytes) : 0
             try handle.seek(toOffset: startOffset)
             let data = handle.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)
+            // 截断点常落在中文/emoji 等多字节 UTF-8 字符中间，严格解码会让整段返回 nil；
+            // 宽松解码只会损坏残缺的首行，而首行本就会被调用方的逐行 JSON 解析跳过
+            return String(decoding: data, as: UTF8.self)
         } catch {
             return nil
         }
@@ -1778,6 +1938,19 @@ final class TelemetryEngine: ObservableObject {
     func stressTestTailRead(path: String, maxBytes: UInt64) -> Bool {
         guard let text = readFileTail(path: path, maxBytes: maxBytes) else { return false }
         return text.contains("turn.step.started")
+    }
+
+    func stressTestUTF16TrailingFlush() -> Bool {
+        // 构造一段无末尾分隔符的 UTF-16LE 中文字符串，验证循环结束后能正常 flush
+        let sample = "正在处理文件读取问题与终端完成检查"
+        var rawBytes: [UInt8] = [0x00, 0x00]
+        for scalar in sample.unicodeScalars {
+            let v = UInt16(scalar.value)
+            rawBytes.append(UInt8(v & 0xFF))
+            rawBytes.append(UInt8((v >> 8) & 0xFF))
+        }
+        let extracted = extractV8UTF16CJKStrings(from: Data(rawBytes))
+        return extracted.contains(sample)
     }
 
     func stressTestNotificationAntiSpam() -> Bool {
@@ -1840,6 +2013,30 @@ final class TelemetryEngine: ObservableObject {
         doneItem2.status = .completed
         doneItem2.completionSignature = "sig-new-202"
         testEngine.processScannedTasks([doneItem2], frontmostBundleId: "com.other.app")
-        return testEngine.recentAlerts.count == 1
+        guard testEngine.recentAlerts.count == 1 else { return false }
+
+        // 4. 另一个应用从 running -> error（>6 秒）：应当触发异常提醒 (status == .error)
+        let errBase = AITaskItem(
+            id: "stress-err-1",
+            appName: "Grok Bot",
+            bundleId: "ai.x.grok.bot",
+            appPath: "/Applications/Grok Bot.app",
+            category: .desktop,
+            taskTitle: "压测报错通知任务",
+            workspace: "grok",
+            fullWorkspacePath: "",
+            statusDetail: "API 异常中断",
+            modelName: "grok-3",
+            status: .error,
+            cpuPercent: 0,
+            updatedAt: Date(),
+            isAppRunning: true,
+            completionSignature: "sig-err-500",
+            canTriggerAlert: true
+        )
+        testEngine.runningStartTimes[errBase.id] = Date().addingTimeInterval(-10.0)
+        testEngine.previousStatuses[errBase.id] = .running
+        testEngine.processScannedTasks([errBase], frontmostBundleId: "com.other.app")
+        return testEngine.recentAlerts.count == 2 && testEngine.recentAlerts.first?.status == .error
     }
 }
